@@ -35,6 +35,12 @@
           Run
         </button>
       </div>
+      <div class="ml-4">
+         OR
+      </div>
+      <div class="flex items-center justify-center gap-x-2 ml-4">
+        <Command /> ALT+ENTER
+      </div>
     </div>
 
     <div class="flex items-center justify-end">
@@ -76,12 +82,12 @@
   </div>
 </template>
 <script setup lang="ts">
-import { markRaw, onMounted, ref, shallowRef, watch } from 'vue'
+import { markRaw, onMounted, onUnmounted, ref, shallowRef, watch } from 'vue'
 import * as monaco from 'monaco-editor'
 import ResizablePanelGroup from '@/components/ui/resizable/ResizablePanelGroup.vue'
 import ResizablePanel from '@/components/ui/resizable/ResizablePanel.vue'
 import ResizableHandle from '@/components/ui/resizable/ResizableHandle.vue'
-import { Loader, Play } from '@lucide/vue'
+import { Command, Loader, Play } from '@lucide/vue'
 const font_size = ref<number>(18)
 const editor = shallowRef<monaco.editor.IStandaloneCodeEditor | null>(null)
 const docs_visible = ref<boolean>(false)
@@ -108,15 +114,15 @@ async function run_code() {
   }
 
   let code = editor.value.getValue()
+  let bytes = new TextEncoder().encode(code)
+
   compiling.value = true
   let resp = await fetch('http://localhost:8080/api/code', {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
     },
-    body: JSON.stringify({
-      code,
-    }),
+    body: bytes,
   })
 
   let o_obj: code_resp = await resp.json()
@@ -137,6 +143,14 @@ function change_font_size(evt: Event) {
 
 function toggle_docs() {
   docs_visible.value = !docs_visible.value
+}
+
+function handle_keydown(evt: KeyboardEvent) {
+  console.log('evt: ', evt)
+  if (evt.altKey && evt.key === 'Enter') {
+    evt.preventDefault()
+    run_code()
+  }
 }
 
 onMounted(() => {
@@ -166,5 +180,11 @@ onMounted(() => {
   })
 
   editor.value = markRaw(ed)
+
+  window.addEventListener('keydown', handle_keydown)
+})
+
+onUnmounted(() => {
+  window.removeEventListener('keydown', handle_keydown)
 })
 </script>

@@ -2,7 +2,10 @@ package main
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -22,24 +25,6 @@ func fail_if_err(err error) {
 	}
 }
 
-func compile(code []byte) (string, error) {
-	dir, err := os.MkdirTemp("", "odin-*")
-	fail_if_err(err)
-
-	src_path := filepath.Join(dir, "main.odin")
-	out_path := filepath.Join(dir, "out")
-
-	os.WriteFile(src_path, []byte(code), 0644)
-
-	cmd := exec.Command("odin", "build", src_path, "-file", "-out:"+out_path)
-	stderr, err := cmd.CombinedOutput()
-	if err != nil {
-		return "", fmt.Errorf("compile error: %s", stderr)
-	}
-
-	return out_path, nil
-}
-
 func cpy_file(src, dst string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -54,36 +39,75 @@ func cpy_file(src, dst string) error {
 	defer out.Close()
 
 	_, err = io.Copy(out, in)
-	return err
+	if err != nil {
+		return err
+	}
+
+	return out.Close()
 }
 
-func run_prog(prog_path string) (string, error) {
-	job_id := uuid.NewString()
-	job_dir := filepath.Join("/tmp/odinground-jobs", job_id)
-	if err := os.MkdirAll(job_dir, 0755); err != nil {
+func compile(code []byte, job_dir string) (string, error) {
+	src_path := filepath.Join(job_dir, "main.odin")
+	out_path := filepath.Join(job_dir, "prog")
+
+	if err := os.WriteFile(src_path, code, 0644); err != nil {
 		return "", err
 	}
 
-	dst := filepath.Join(job_dir, "prog")
-	if err := cpy_file(prog_path, dst); err != nil {
+	sum := sha256.Sum256(code)
+	hash := hex.EncodeToString(sum[:])
+
+	cache_dir := filepath.Join("/tmp/odinground-cache", hash)
+	cache_out := filepath.Join(cache_dir, "prog")
+
+	if _, err := os.Stat(cache_out); err == nil {
+		if err := os.Link(cache_out, out_path); err != nil {
+			if err := cpy_file(cache_out, out_path); err != nil {
+				return "", err
+			}
+		}
+		return out_path, nil
+	} else if !errors.Is(err, os.ErrNotExist) {
 		return "", err
 	}
 
-	os.Chmod(dst, 0755)
+	if err := os.MkdirAll(cache_dir, 0755); err != nil {
+		return "", err
+	}
 
+	cmd := exec.Command("odin", "build", src_path, "-file", "-out:"+out_path)
+
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return "", fmt.Errorf("compile error: %w: %s", err, out)
+	}
+
+	if err := os.Link(out_path, cache_out); err != nil {
+		_ = cpy_file(out_path, cache_out)
+	}
+
+	return out_path, nil
+}
+
+func run_prog(job_id string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
+
 	cmd := exec.CommandContext(ctx,
 		"docker", "exec",
 		"odin-worker",
 		"/jobs/"+job_id+"/prog",
 	)
+
 	result, err := cmd.CombinedOutput()
 	if ctx.Err() == context.DeadlineExceeded {
-		return "", fmt.Errorf("timeout")
+		return string(result), fmt.Errorf("timeout")
+	}
+	if err != nil {
+		return string(result), fmt.Errorf("run error: %w: %s", err, result)
 	}
 
-	return string(result), err
+	return string(result), nil
 }
 
 func create_runtime() error {
@@ -144,35 +168,56 @@ func write_json(w http.ResponseWriter, status int, data map[string]any) error {
 
 func handle_exec_code(w http.ResponseWriter, r *http.Request) {
 	var (
-		err      error
-		out_path string
-		output   string
+		err    error
+		output string
+		start  = time.Now()
 	)
 	defer func() {
 		if err != nil {
 			log.Printf("err: %v output: %s", err, output)
 		}
+
+		log.Printf("time to serve=%v", time.Since(start))
 	}()
 
-	var p struct {
-		Code string `json:"code"`
-	}
-
-	if err = json.NewDecoder(r.Body).Decode(&p); err != nil {
+	code_bytes, err := io.ReadAll(r.Body)
+	if err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	code := p.Code
-	out_path, err = compile([]byte(code))
-	if err != nil {
-		write_json(w, http.StatusInternalServerError, map[string]any{"error": err})
+
+	job_id := uuid.NewString()
+	job_dir := filepath.Join("/tmp/odinground-jobs", job_id)
+
+	// mkdirtime := time.Now()
+	if err = os.MkdirAll(job_dir, 0755); err != nil {
+		write_json(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
-	output, err = run_prog(out_path)
+
+	// log.Printf("time to mkdir=%v", time.Since(mkdirtime))
+
+	defer os.RemoveAll(job_dir)
+
+	// compiletime := time.Now()
+	_, err = compile(code_bytes, job_dir)
 	if err != nil {
-		write_json(w, http.StatusInternalServerError, map[string]any{"error": err})
+		write_json(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
+
+	// log.Printf("time to compile=%v", time.Since(compiletime))
+
+	// runtime := time.Now()
+	output, err = run_prog(job_id)
+	if err != nil {
+		write_json(w, http.StatusInternalServerError, map[string]any{
+			"output": output,
+			"error":  err.Error(),
+		})
+		return
+	}
+	// log.Printf("time to run=%v", time.Since(runtime))
 
 	write_json(w, http.StatusOK, map[string]any{"output": output})
 }
